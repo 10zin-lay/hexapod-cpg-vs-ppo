@@ -29,7 +29,7 @@ pip install mujoco stable-baselines3 scipy matplotlib tensorboard tqdm rich
 | `view_parallel.py` | Side-by-side comparison of CPG, PPO-flat, and PPO-DR |
 | `train_hexapod_ppo.py` | Train PPO on flat terrain |
 | `train_hexapod_dr.py` | Train PPO with domain randomization (all terrains) |
-| `compare_cpg_ppo.py` | Headless evaluation — prints comparison table and saves plots |
+| `compare_cpg_ppo.py` | Headless evaluation, prints comparison table and saves plots |
 | `terrain_generator.py` | MuJoCo heightfield terrain generator |
 
 ## Usage
