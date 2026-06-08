@@ -22,6 +22,9 @@ logs/
 # Third-party repo (clone separately — see README)
 one_policy_to_run_them_all/
 
+# Claude Code internal
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
