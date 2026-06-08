@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.env/
+
+# Training checkpoints (large binary files)
+checkpoints/
+
+# TensorBoard logs
+logs/
+
+# Generated plots
+*.png
+
+# Pickle/reward history
+*.pkl
+
+# Third-party repo (clone separately — see README)
+one_policy_to_run_them_all/
+
+# OS
+.DS_Store
+Thumbs.db
