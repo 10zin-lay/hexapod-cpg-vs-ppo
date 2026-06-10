@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from terrain_generator import TerrainGenerator
 
@@ -48,8 +48,26 @@ NOMINAL = np.array([
     -0.7, -0.6,  2.0,
 ])
 
-TERRAIN_TYPES = ["flat", "rough", "slope", "stairs", "hills"]
-DEVICE        = "cpu"
+DEVICE = "cpu"
+N_ENVS = 4
+
+# Curriculum: terrain distribution shifts as training progresses
+# Each entry is (up_to_step, terrain_pool)
+CURRICULUM = [
+    (2_000_000,  ["flat"] * 8 + ["rough"] * 2),
+    (5_000_000,  ["flat"] * 4 + ["rough"] * 2 + ["slope"] * 2 + ["hills"] * 2),
+    (10_000_000, ["flat"] * 2 + ["rough"] * 2 + ["slope"] * 2 + ["stairs"] * 2 + ["hills"] * 2),
+]
+
+_GLOBAL_STEP = [0]   # shared counter updated by callback
+
+ALL_TERRAINS = ["flat", "rough", "slope", "stairs", "hills"]
+
+def get_terrain_pool(global_step: int) -> list:
+    for max_step, pool in CURRICULUM:
+        if global_step < max_step:
+            return pool
+    return CURRICULUM[-1][1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +87,16 @@ class HexapodDREnv(gym.Env):
         self.step_count = 0
         self.kp         = 20.0
         self.kd         = 0.8
+
+        # geom ids for collision penalty (hip/knee/base dragging on terrain)
+        self.floor_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        collision_geom_names = (
+            [f"hip_{i}" for i in range(6)] + [f"knee_{i}" for i in range(6)] + ["base"]
+        )
+        self.collision_ids = [
+            mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_GEOM, name)
+            for name in collision_geom_names
+        ]
 
         # obs: 18 joint pos + 18 joint vel + 3 body vel + 3 euler = 42
         self.observation_space = spaces.Box(
@@ -99,8 +127,14 @@ class HexapodDREnv(gym.Env):
         super().reset(seed=seed)
 
         # ── randomise terrain each episode ──────────────────────────────────
-        terrain    = random.choice(TERRAIN_TYPES)
-        difficulty = random.uniform(0.1, 0.8)
+        terrain    = random.choice(get_terrain_pool(_GLOBAL_STEP[0]))
+        step       = _GLOBAL_STEP[0]
+        if step < 2_000_000:
+            difficulty = random.uniform(0.1, 0.5)
+        elif step < 5_000_000:
+            difficulty = random.uniform(0.2, 0.7)
+        else:
+            difficulty = random.uniform(0.4, 1.0)
 
         if terrain == "flat":
             self.tg.flat()
@@ -148,12 +182,24 @@ class HexapodDREnv(gym.Env):
         lateral_vel_ms = abs(self.d.qvel[1])
         self.prev_x    = self.d.qpos[0]
 
+        # penalize hip/knee/base dragging or slamming into the terrain
+        collision_penalty = 0.0
+        for i in range(self.d.ncon):
+            c = self.d.contact[i]
+            g1, g2 = c.geom1, c.geom2
+            if g1 == self.floor_id and g2 in self.collision_ids:
+                collision_penalty += 1.0
+            elif g2 == self.floor_id and g1 in self.collision_ids:
+                collision_penalty += 1.0
+
         reward = (
              8.0 * forward_vel_ms
             - 2.0 * lateral_vel_ms
             - 2.0 * tilt
             - 0.001 * float(np.sum(action ** 2))
+            - 1.0 * collision_penalty
         )
+        reward = max(reward, 0.0)
 
         # tighter fall threshold to account for terrain height variation
         terrain_h  = self.tg.height_at(self.d.qpos[0], self.d.qpos[1])
@@ -179,6 +225,7 @@ class RewardLogger(BaseCallback):
         self._ep_reward      = 0.0
 
     def _on_step(self):
+        _GLOBAL_STEP[0] = self.num_timesteps   # keep curriculum in sync
         self._ep_reward += float(self.locals["rewards"][0])
         if self.locals["dones"][0]:
             self.episode_rewards.append(self._ep_reward)
@@ -210,18 +257,18 @@ def _latest_checkpoint(ckpt_dir, prefix):
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def train(total_timesteps=5_000_000):
+def train(total_timesteps=10_000_000):
     print(f"\n{'='*55}")
     print(f"  Domain Randomization PPO  |  device: {DEVICE}")
-    print(f"  Terrains: {TERRAIN_TYPES}")
+    print(f"  Terrains: {ALL_TERRAINS} (curriculum)")
     print(f"  Difficulty: 0.1 – 0.8 (random each episode)")
     print(f"{'='*55}")
 
-    ckpt_dir    = os.path.join("checkpoints", "dr")
+    ckpt_dir    = os.path.join("checkpoints", "dr_v2")
     ckpt_prefix = "ppo_hexapod_dr"
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    env           = DummyVecEnv([HexapodDREnv])
+    env           = SubprocVecEnv([HexapodDREnv] * N_ENVS)
     reward_logger = RewardLogger()
     checkpoint_cb = CheckpointCallback(
         save_freq   = 50_000,
@@ -244,21 +291,33 @@ def train(total_timesteps=5_000_000):
                          tensorboard_log="./logs/dr")
     else:
         remaining = total_timesteps
-        model = PPO(
-            "MlpPolicy",
-            env,
-            learning_rate   = 3e-4,
-            n_steps         = 4096,
-            batch_size      = 256,
-            n_epochs        = 10,
-            gamma           = 0.99,
-            gae_lambda      = 0.95,
-            clip_range      = 0.2,
-            ent_coef        = 0.01,
-            verbose         = 1,
-            device          = DEVICE,
-            tensorboard_log = "./logs/dr",
-        )
+        flat_path = "ppo_hexapod_flat.zip"
+        if os.path.exists(flat_path):
+            print(f"  Warm-starting from flat walking model: {flat_path}")
+            # lower LR: the heightfield floor (even when flat) has different
+            # contact dynamics than the plane the flat model was trained on,
+            # so the first updates see a big distribution shift — a smaller
+            # LR keeps those updates from wrecking the pretrained gait.
+            model = PPO.load(flat_path, env=env, device=DEVICE,
+                             learning_rate=1e-4,
+                             tensorboard_log="./logs/dr")
+        else:
+            print("  No flat model found — training from scratch")
+            model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate   = 3e-4,
+                n_steps         = 4096,
+                batch_size      = 256,
+                n_epochs        = 10,
+                gamma           = 0.99,
+                gae_lambda      = 0.95,
+                clip_range      = 0.2,
+                ent_coef        = 0.01,
+                verbose         = 1,
+                device          = DEVICE,
+                tensorboard_log = "./logs/dr",
+            )
 
     model.learn(
         total_timesteps     = remaining,
@@ -281,9 +340,9 @@ def train(total_timesteps=5_000_000):
 # EVALUATE
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate(n_episodes=10):
-    model  = PPO.load("ppo_hexapod_dr", device=DEVICE)
-    env    = HexapodDREnv()
-    counts = {t: {"rewards": [], "distances": []} for t in TERRAIN_TYPES}
+    model      = PPO.load("ppo_hexapod_dr", device=DEVICE)
+    env        = HexapodDREnv()
+    all_rewards = []
 
     for ep in range(n_episodes):
         obs, _     = env.reset()
@@ -299,10 +358,11 @@ def evaluate(n_episodes=10):
             done      = terminated or truncated
 
         dist = env.d.qpos[0] - start_x
+        all_rewards.append(total_r)
         print(f"  ep {ep+1:2d}: reward={total_r:7.1f}  dist={dist:.3f} m")
 
     env.close()
-    print(f"\n  Avg reward : {np.mean([r for t in counts.values() for r in t['rewards']]):.1f}")
+    print(f"\n  Avg reward : {np.mean(all_rewards):.1f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +392,7 @@ def plot_results(rewards):
 if __name__ == "__main__":
     print(f"PyTorch : {torch.__version__}  |  Device: {DEVICE}")
 
-    rewards = train(total_timesteps=5_000_000)
+    rewards = train(total_timesteps=10_000_000)
 
     with open("dr_rewards.pkl", "wb") as f:
         pickle.dump(rewards, f)

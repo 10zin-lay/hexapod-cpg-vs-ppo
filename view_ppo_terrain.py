@@ -44,11 +44,14 @@ if not os.path.exists(MODEL_PATH):
     print(f"ERROR: '{MODEL_PATH}' not found.")
     sys.exit(1)
 
+# flat terrain → use the plain XML (same as training, no heightfield physics mismatch)
+# non-flat     → use terrain XML with heightfield
+_xml_file = "hexapod.xml" if terrain == "flat" else "hexapod_terrain.xml"
 XML_PATH = os.path.join(
     os.path.dirname(__file__),
     "one_policy_to_run_them_all",
     "one_policy_to_run_them_all",
-    "environments", "hexapod", "data", "hexapod_terrain.xml",
+    "environments", "hexapod", "data", _xml_file,
 )
 
 NOMINAL = np.array([
@@ -66,24 +69,25 @@ DIFFICULTY = 1.0
 print(f"\nGenerating '{terrain}' terrain...")
 m  = mujoco.MjModel.from_xml_path(XML_PATH)
 d  = mujoco.MjData(m)
-tg = TerrainGenerator(m)
 
 if terrain == "flat":
-    tg.flat()
-elif terrain == "rough":
-    tg.rough(difficulty=DIFFICULTY)
-elif terrain == "slope":
-    tg.slope(difficulty=DIFFICULTY)
-elif terrain == "stairs":
-    tg.stairs(difficulty=DIFFICULTY)
-elif terrain == "hills":
-    tg.hills(difficulty=DIFFICULTY)
-elif terrain == "random":
-    terrain = tg.random(difficulty=DIFFICULTY)   # returns the chosen name
+    spawn_z = 0.3
+else:
+    tg = TerrainGenerator(m)
+    if terrain == "rough":
+        tg.rough(difficulty=DIFFICULTY)
+    elif terrain == "slope":
+        tg.slope(difficulty=DIFFICULTY)
+    elif terrain == "stairs":
+        tg.stairs(difficulty=DIFFICULTY)
+    elif terrain == "hills":
+        tg.hills(difficulty=DIFFICULTY)
+    elif terrain == "random":
+        terrain = tg.random(difficulty=DIFFICULTY)
+    spawn_z = tg.height_at(0.0, 0.0) + 0.25
 
 # settle robot on top of terrain
 mujoco.mj_resetData(m, d)
-spawn_z    = tg.height_at(0.0, 0.0) + 0.25
 d.qpos[2]  = spawn_z
 d.qpos[7:] = NOMINAL.copy()
 mujoco.mj_forward(m, d)
